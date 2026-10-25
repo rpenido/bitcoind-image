@@ -1,0 +1,125 @@
+name: build
+
+on:
+  schedule:
+    # Weekly check for a new Bitcoin Core release. GitHub cron is best effort.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Core version, e.g. 31.1. Empty = latest upstream release"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - keys/**
+      - .github/workflows/build.yaml
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # bump VERSION
+  packages: write       # push to GHCR
+  id-token: write       # provenance attestation
+  attestations: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/bitcoind
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      changed: ${{ steps.resolve.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: resolve
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ver="${REQUESTED:-}"
+          if [ -z "$ver" ]; then
+            ver=$(curl -fsSL https://api.github.com/repos/bitcoin/bitcoin/releases/latest \
+                  | jq -r .tag_name | sed 's/^v//')
+          fi
+          # Only accept versions whose binaries are actually published.
+          sums="https://bitcoincore.org/bin/bitcoin-core-${ver}/SHA256SUMS"
+          curl -fsSL "$sums" -o /tmp/SHA256SUMS
+          sha=$(grep " bitcoin-${ver}-x86_64-linux-gnu.tar.gz$" /tmp/SHA256SUMS | awk '{print $1}')
+          test -n "$sha"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$ver" = "$(cat VERSION)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "resolved Core $ver ($sha)"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and smoke test
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "BITCOIN_VERSION=${VERSION}" \
+            --build-arg "BITCOIN_SHA256=${{ needs.resolve.outputs.sha }}" \
+            -t bitcoind:smoke .
+          docker run --rm --entrypoint bitcoind bitcoind:smoke --version | head -1
+          docker run --rm --entrypoint bitcoind bitcoind:smoke -version | grep -F "${VERSION}"
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.resolve.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          build-args: |
+            BITCOIN_VERSION=${{ needs.resolve.outputs.version }}
+            BITCOIN_SHA256=${{ needs.resolve.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Bump VERSION
+        run: |
+          set -euo pipefail
+          echo "${VERSION}" > VERSION
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git diff --cached --quiet || git commit -m "chore: bump Bitcoin Core to ${VERSION}"
+          git push
