@@ -34,6 +34,9 @@ The homeserver runs `ghcr.io/rpenido/bitcoind:latest` and Komodo watches the
 digest, so a new upstream release rolls out without manual work. The version
 tags are kept for rollback.
 
+A monthly `keepalive` workflow commits a timestamp so GitHub does not disable
+the weekly schedule after 60 days without repository activity.
+
 ## Deliberate choices
 
 - `USER 1000:1000`, so PID 1 is not root. The node data directory is owned by
